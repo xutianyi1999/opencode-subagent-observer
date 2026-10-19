@@ -57,15 +57,18 @@ OpenCode 在后台加载插件，初次查询插件列表时可能尚未显示�
 
 `list_subagents({ limit?, cursor? })`：列出调用者的直接子任务，排除 fork；返回会话 ID、标题、agent/model、活动状态和上次执行结果。
 
-`inspect_subagent({ sessionID, view?, include?, limit?, maxChars?, afterSeq? })`：
+`inspect_subagent({ sessionID, view?, include?, limit?, maxChars?, afterSeq?, cursor?, messageID?, offset?, revision? })`：
 
 | 参数 | 默认值 / 含义 |
 | --- | --- |
 | `view` | `snapshot`；也可用 `changes` |
-| `include` | `["messages", "tools"]`；可加入 `reasoning` |
+| `include` | 默认 `["messages", "reasoning", "tools"]`；可主动排除不需要的部分 |
 | `limit` | 20，上限 100 |
 | `maxChars` | 12000，上限 40000；限制详细过程的数据预算，不包括状态元数据 |
 | `afterSeq` | changes 模式的排他水位，下一次传入上次返回的 nextAfterSeq |
+| `cursor` | snapshot 的历史分页游标，使用上次返回的 cursor |
+| `messageID` | snapshot 中按 ID 读取一条消息的完整可见数据 |
+| `offset` / `revision` | 按消息返回的 nextOffset 和 revision 继续读取，默认从 0 开始 |
 
 例如：
 
@@ -81,14 +84,24 @@ OpenCode 在后台加载插件，初次查询插件列表时可能尚未显示�
 轮询频率和如何利用结果由主 agent 决定；插件不会在主 agent 停止后主动唤醒它。
 后台 subagent 的原生完成通知仍由 OpenCode 保留。
 
+快照为本页每条消息和每个所选片段保留条目，工具名称、调用 ID、状态和错误摘要不会被长推理挤掉。
+正文预算均分给所选片段；truncated 表示预览不完整，并不表示该消息或工具被略过。
+系统、独立 shell、压缩、切换和 idle 消息也包含在 messages 范围内；无正文的 assistant 错误仍会显示。
+
+读取较早记录时继续传 cursor；刷新当前进度时省略 cursor。历史查询的 activity 仍来自最新页。
+要查看被裁剪的内容，传入条目的 messageID；结果返回 JSON 文本 text、nextOffset 和 revision。
+后续使用同一个 messageID/include/revision 并传 offset=nextOffset，可逐段读完，不受单次文本预算限制。
+如果消息在续读期间改变，会明确要求从 offset=0 重读，避免拼接不同内容。
+分页和单条消息获取均由官方 SDK 实现，插件不缓存或重建会话历史。
+
 ## 可见性与宿主差异
 
 - `execution.active` 与 `execution.lastOutcome` 分开表达，inactive 不等于任务完成。
 - reasoning 只包括模型提供商已经暴露并由 OpenCode 保存的文本；未结束的流片段不可读。
-- snapshot 返回最近的投影消息；重新查询可以看到同一消息中更新的工具状态。
+- snapshot 默认返回最近一页投影消息，可翻页；重新查询可以看到同一消息中更新的工具状态。
 - changes 尝试有限读取官方持久日志，不订阅后续事件。
 - 若宿主只返回日志序号而不返回事件正文，结果明确标注 `historyUnavailable: true`，同时返回当前 `snapshot` 与更新后的水位。这不能重建两次轮询间的所有中间事件。
-- 文本裁剪会显式标记 `truncated`；没有额外 LLM 摘要和摘要费用。
+- 文本裁剪会显式标记 `truncated`，可以按消息分段补读；没有额外 LLM 摘要和摘要费用。
 
 ## 真实联调
 
@@ -98,5 +111,6 @@ bun run test:live
 
 脚本使用现有服务，在临时目录创建独立父子会话，调用可用的零费用模型 `opencode/mimo-v2.6-flash-free`。
 先检查模型费用；不可用时失败，不回退到付费模型。
-主 agent 调用观察工具；子 agent 执行等待和读取 README 的任务。测试结束后比较子会话消息与持久日志，验证观察没有写入。
+主 agent 调用观察工具，包括历史翻页和消息分段读取；子 agent 执行等待和读取 README 的任务。
+测试结束后比较子会话消息与持久日志，验证观察没有写入。
 报告保存在 `.test-artifacts/live-report.json`。测试会话保留以便检查，不改动已有用户会话。

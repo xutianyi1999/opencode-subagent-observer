@@ -40,8 +40,10 @@ function fixture() {
           state: { status: "running", input: { path: "README.md" }, metadata: {} } },
       ],
     }] as SessionMessageInfo[],
+    olderMessages: [] as SessionMessageInfo[],
     events: [textEvent(1), textEvent(2)] as SessionLogItem[],
     omitLogEvents: false,
+    onLog: () => {},
     permissions: [] as Array<{ id: string; sessionID: string; action: string; resources: string[] }>,
     requests: [] as Array<{ method: string; url: URL }>,
   }
@@ -53,8 +55,16 @@ function fixture() {
       if (request.method !== "GET") return new Response("Unexpected write", { status: 405 })
       if (url.pathname === "/api/session/active") return Response.json({ data: state.active ? { child: { type: "running" } } : {} })
       if (url.pathname === "/api/session") return Response.json({ data: state.sessions, cursor: { next: "next-page" } })
-      if (url.pathname.endsWith("/message")) return Response.json({ data: state.messages, cursor: {} })
+      if (url.pathname.endsWith("/message")) return Response.json({
+        data: url.searchParams.has("cursor") ? state.olderMessages : state.messages,
+        cursor: !url.searchParams.has("cursor") && state.olderMessages.length ? { next: "older-page" } : {},
+      })
+      if (url.pathname.includes("/message/")) {
+        const message = [...state.messages, ...state.olderMessages].find((entry) => entry.id === url.pathname.split("/").at(-1))
+        return message ? Response.json({ data: message }) : new Response("Unknown message", { status: 404 })
+      }
       if (url.pathname.endsWith("/log")) {
+        state.onLog()
         const after = Number(url.searchParams.get("after") ?? 0)
         const events = state.events.filter((event) => event.type !== "log.synced" && event.durable.seq > after)
         const seq = state.events.at(-1)
@@ -95,15 +105,143 @@ test("active execution does not overwrite the last completed outcome", async () 
   const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child" }), signal())
   expect(result.execution).toEqual({ active: true, lastOutcome: "succeeded", lastIdleAt: 2 })
   expect(result.activity.phase).toBe("tool_running")
-  expect(JSON.stringify(result)).not.toContain("Visible reasoning")
+  expect(JSON.stringify(result)).toContain("Visible reasoning")
   expect(f.state.requests.every((request) => request.method === "GET")).toBe(true)
 })
 
-test("reasoning is opt-in and provider state is omitted", async () => {
+test("reasoning can be selected explicitly and provider state is omitted", async () => {
   const f = fixture()
   const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", include: ["reasoning"] }), signal())
   expect(JSON.stringify(result)).toContain("Visible reasoning")
   expect(JSON.stringify(result)).not.toContain("do not expose")
+})
+
+test("reasoning can be explicitly excluded without losing tool calls", async () => {
+  const f = fixture()
+  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", include: ["messages", "tools"] }), signal())
+  expect(JSON.stringify(result)).not.toContain("Visible reasoning")
+  expect(JSON.stringify(result)).toContain("README.md")
+})
+
+test("long reasoning cannot crowd out tool identities, errors or older messages", async () => {
+  const f = fixture()
+  const message = f.state.messages[0]
+  if (message?.type !== "assistant") throw new Error("Missing assistant fixture")
+  message.content = [
+    { type: "reasoning", text: "x".repeat(20000) },
+    { type: "tool", id: "important-call", name: "read", time: { created: 3 },
+      state: { status: "error", input: { path: "missing.txt" }, error: { type: "NotFound", message: "Important failure" } } },
+  ]
+  f.state.messages.push({ id: "older", type: "user", time: { created: 1 }, text: "Earlier request" })
+  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", maxChars: 256 }), signal())
+  if (!("items" in result)) throw new Error("Expected snapshot")
+  expect(result.items.map((item) => "messageID" in item ? item.messageID : undefined)).toEqual(["msg", "older"])
+  expect(JSON.stringify(result.items)).toContain("important-call")
+  expect(JSON.stringify(result.items)).toContain("Important failure")
+  expect(JSON.stringify(result.items)).toContain('"status":"error"')
+  expect(result.truncated).toBe(true)
+})
+
+test("assistant failures without text, system, shell, compaction and control messages are retained", async () => {
+  const f = fixture()
+  const assistant = f.state.messages[0]
+  if (assistant?.type !== "assistant") throw new Error("Missing assistant fixture")
+  f.state.messages = [
+    { ...assistant, content: [], error: { type: "ProviderError", message: "Model unavailable" } },
+    { id: "sys", type: "system", time: { created: 1 }, text: "Instruction update" },
+    { id: "shell", type: "shell", time: { created: 1 }, shellID: "shell-id", command: "pwd", status: "exited", exit: 0,
+      output: { output: "/fixture", cursor: 8, size: 8, truncated: false } },
+    { id: "compact", type: "compaction", status: "running", time: { created: 1 }, reason: "auto", summary: "Summary", recent: "Recent" },
+    { id: "switch", type: "agent-switched", time: { created: 1 }, agent: "general", previous: "explore" },
+    { id: "idle", type: "idle", time: { created: 1 }, outcome: "failed", error: { type: "Failure", message: "Execution failed" } },
+  ]
+  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child" }), signal())
+  if (!("items" in result)) throw new Error("Expected snapshot")
+  expect(result.items.map((item) => item.type)).toEqual(["assistant", "system", "shell", "compaction", "agent-switched", "idle"])
+  expect(JSON.stringify(result.items)).toContain("Model unavailable")
+  expect(JSON.stringify(result.items)).toContain("Instruction update")
+  expect(JSON.stringify(result.items)).toContain("Execution failed")
+})
+
+test("older history uses the official cursor without changing current activity", async () => {
+  const f = fixture()
+  f.state.olderMessages = [{ id: "old", type: "user", time: { created: 1 }, text: "Earlier task" }]
+  const first = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child" }), signal())
+  if (!("cursor" in first)) throw new Error("Expected snapshot")
+  expect(first.cursor).toBe("older-page")
+  const older = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", cursor: first.cursor }), signal())
+  if (!("items" in older)) throw new Error("Expected snapshot")
+  expect(older.items.map((item) => "messageID" in item ? item.messageID : undefined)).toEqual(["old"])
+  expect(older.activity.phase).toBe("tool_running")
+  const request = f.state.requests.find((request) => request.url.searchParams.has("cursor"))
+  expect(request?.url.searchParams.get("cursor")).toBe("older-page")
+  expect(request?.url.searchParams.has("order")).toBe(false)
+})
+
+test("a long message can be recovered completely in bounded chunks using the SDK message endpoint", async () => {
+  const f = fixture()
+  const original = "完整文本🙂".repeat(1000)
+  f.state.messages = [{ id: "long", type: "system", time: { created: 1 }, text: original }]
+  const chunks: string[] = []
+  const first = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", messageID: "long", maxChars: 400 }), signal())
+  if (!("nextOffset" in first)) throw new Error("Expected message detail")
+  chunks.push(first.text)
+  let nextOffset = first.nextOffset
+  while (nextOffset !== null) {
+    const next = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", messageID: "long", maxChars: 400, offset: nextOffset, revision: first.revision }), signal())
+    if (!("nextOffset" in next)) throw new Error("Expected message detail")
+    expect(next.text.length).toBeLessThanOrEqual(400)
+    chunks.push(next.text)
+    nextOffset = next.nextOffset
+  }
+  expect(JSON.parse(chunks.join("")).text).toBe(original)
+  expect(f.state.requests.some((request) => request.url.pathname.endsWith("/message/long"))).toBe(true)
+  expect(f.state.requests.every((request) => request.method === "GET")).toBe(true)
+})
+
+test("continuing a changed message fails explicitly instead of combining different revisions", async () => {
+  const f = fixture()
+  f.state.messages = [{ id: "long", type: "system", time: { created: 1 }, text: "x".repeat(1000) }]
+  const first = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", messageID: "long", maxChars: 256 }), signal())
+  if (!("nextOffset" in first) || first.nextOffset === null) throw new Error("Expected chunked message")
+  f.state.messages = [{ id: "long", type: "system", time: { created: 1 }, text: "Updated content" }]
+  await expect(inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", messageID: "long", offset: first.nextOffset, revision: first.revision }), signal())).rejects.toThrow("Message changed")
+})
+
+test("message detail preserves complete reasoning, tool arguments and results", async () => {
+  const f = fixture()
+  const message = f.state.messages[0]
+  if (message?.type !== "assistant") throw new Error("Missing assistant fixture")
+  const reasoning = "reasoning ".repeat(1000)
+  const output = "tool result ".repeat(1000)
+  message.content = [
+    { type: "reasoning", text: reasoning, state: { encrypted: "private-state" } },
+    { type: "tool", id: "full-call", name: "shell", executed: true, time: { created: 3, completed: 4 },
+      providerState: { encrypted: "private-state" },
+      state: { status: "completed", input: { command: "read fixture" }, content: [{ type: "text", text: output }] } },
+  ]
+  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", messageID: "msg", maxChars: 40000 }), signal())
+  if (!("text" in result)) throw new Error("Expected message detail")
+  const decoded = JSON.parse(result.text)
+  expect(decoded.content[0].text).toBe(reasoning)
+  expect(decoded.content[1].state.input).toEqual({ command: "read fixture" })
+  expect(decoded.content[1].state.content[0].text).toBe(output)
+  expect(decoded.content[1].executed).toBe(true)
+  expect(result.text).not.toContain("private-state")
+})
+
+test("compaction activity is identified from the current projection", async () => {
+  const f = fixture()
+  f.state.messages = [{ id: "compact", type: "compaction", status: "running", time: { created: 3 }, reason: "auto", summary: "", recent: "" }]
+  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child" }), signal())
+  expect(result.activity.phase).toBe("compacting")
+})
+
+test("message detail cannot bypass child ownership checks", async () => {
+  const f = fixture()
+  f.state.sessions = [session("child", "other")]
+  await expect(inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", messageID: "msg" }), signal())).rejects.toThrow("direct")
+  expect(f.state.requests.map((request) => request.url.pathname)).toEqual(["/api/session/child"])
 })
 
 test("a failed tool does not turn the whole child into a failed execution", async () => {
@@ -115,6 +253,7 @@ test("a failed tool does not turn the whole child into a failed execution", asyn
   const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child" }), signal())
   expect(result.execution.active).toBe(true)
   expect(result.execution.lastOutcome).toBe("succeeded")
+  if (!("items" in result)) throw new Error("Expected snapshot")
   expect(JSON.stringify(result.items)).toContain("File missing")
 })
 
@@ -195,6 +334,43 @@ test("a host with sequence markers but no event bodies returns an explicit snaps
   expect(result.historyUnavailable).toBe(true)
   expect(result.items).toEqual([])
   expect(JSON.stringify(result.snapshot)).toContain("README.md")
+})
+
+test("fallback snapshots are fetched after the log boundary they acknowledge", async () => {
+  const f = fixture()
+  f.state.omitLogEvents = true
+  f.state.onLog = () => {
+    f.state.messages = [{ id: "fresh", type: "system", time: { created: 4 }, text: "Newly projected update" }]
+  }
+  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", view: "changes" }), signal())
+  expect(JSON.stringify(result.snapshot)).toContain("Newly projected update")
+  const paths = f.state.requests.map((request) => request.url.pathname)
+  expect(paths.indexOf("/api/experimental/session/child/log")).toBeLessThan(paths.indexOf("/api/session/child/message"))
+})
+
+test("durable content replacements retain tools and reasoning without exposing provider checkpoints", async () => {
+  const f = fixture()
+  f.state.events = [{
+    id: "evt-1", type: "session.message.content.updated", created: 1,
+    durable: { aggregateID: "child", seq: 1, version: 1 },
+    data: { sessionID: "child", messageID: "msg", content: [
+      { type: "reasoning", text: "Replaced reasoning", state: { encrypted: "hidden-checkpoint" } },
+      { type: "tool", id: "replacement-call", name: "read", time: { created: 1 },
+        providerState: { encrypted: "hidden-checkpoint" },
+        state: { status: "completed", input: { path: "README.md" }, content: [{ type: "text", text: "Replacement result" }] } },
+    ] },
+  }]
+  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", view: "changes" }), signal())
+  expect(JSON.stringify(result)).toContain("Replaced reasoning")
+  expect(JSON.stringify(result)).toContain("Replacement result")
+  expect(JSON.stringify(result)).not.toContain("hidden-checkpoint")
+})
+
+test("incompatible pagination and detail arguments are rejected at the schema boundary", () => {
+  expect(InspectInput.safeParse({ sessionID: "child", view: "changes", cursor: "older" }).success).toBe(false)
+  expect(InspectInput.safeParse({ sessionID: "child", messageID: "msg", cursor: "older" }).success).toBe(false)
+  expect(InspectInput.safeParse({ sessionID: "child", offset: 2 }).success).toBe(false)
+  expect(InspectInput.safeParse({ sessionID: "child", messageID: "msg", offset: 2 }).success).toBe(false)
 })
 
 test("caller cancellation reaches the SDK", async () => {

@@ -31,7 +31,10 @@ await client.session.prompt({ sessionID: parent.id, text: [
   "3. Call inspect_subagent on its sessionID with view=snapshot and include=[messages,reasoning,tools]. Report its current state.",
   "4. Call inspect_subagent with view=changes, include=[messages,reasoning,tools], limit=100. Save nextAfterSeq.",
   "5. Call inspect_subagent with view=changes and afterSeq set to the previously returned nextAfterSeq.",
-  "6. Call inspect_subagent once more with view=snapshot and include=[messages,reasoning,tools]. Finish with a short test report.",
+  "6. Call inspect_subagent once more with view=snapshot, limit=1. Then pass the returned cursor to another snapshot query to read an older history page.",
+  "7. Query snapshot with limit=100 and maxChars=256. Choose an item with type=user and remember its messageID. The preview may be truncated; the message entry must still exist.",
+  "8. Call inspect_subagent with that messageID and maxChars=256 to read the original child task. If nextOffset is not null, call it again with the same messageID, offset=nextOffset, revision from the first chunk, and maxChars=256.",
+  "9. Finish with a short test report. Do not restart completed work or call more tools after this.",
   "Use the observer tools directly. Do not use shell, sleep, or other tools in the parent. Do not repeat the child's work.",
 ].join("\n") })
 
@@ -55,6 +58,10 @@ if (!observations.some((call) => call.name === "list_subagents") || observations
   throw new Error("Parent did not exercise both observation tools and incremental reads")
 }
 if (observations.some((call) => call.state.status !== "completed")) throw new Error("An observation call failed")
+const historyRead = observations.some((call) => call.state.status === "completed" && typeof call.state.input.cursor === "string")
+const messageRead = observations.some((call) => call.state.status === "completed" && typeof call.state.input.messageID === "string")
+const chunkRead = observations.some((call) => call.state.status === "completed" && typeof call.state.input.offset === "number" && call.state.input.offset > 0)
+if (!historyRead || !messageRead || !chunkRead) throw new Error("Parent did not exercise history pagination and long-message continuation")
 const children = await client.session.list({ parentID: parent.id })
 const child = children.data.find((entry) => !entry.fork)
 if (!child) throw new Error("No real child session created")
@@ -64,6 +71,9 @@ const beforeLog = []
 for await (const event of client.session.log({ sessionID: child.id, after: 0, follow: false })) beforeLog.push(event)
 await inspectSubagent(client, parent.id, InspectInput.parse({ sessionID: child.id, include: ["messages", "reasoning", "tools"] }), AbortSignal.timeout(15000))
 await inspectSubagent(client, parent.id, InspectInput.parse({ sessionID: child.id, view: "changes" }), AbortSignal.timeout(15000))
+const originalPrompt = before.data.find((message) => message.type === "user")
+if (!originalPrompt) throw new Error("Missing original child prompt")
+await inspectSubagent(client, parent.id, InspectInput.parse({ sessionID: child.id, messageID: originalPrompt.id, maxChars: 256 }), AbortSignal.timeout(15000))
 const after = await client.message.list({ sessionID: child.id, limit: 200, order: "asc" })
 const afterLog = []
 for await (const event of client.session.log({ sessionID: child.id, after: 0, follow: false })) afterLog.push(event)
@@ -82,6 +92,7 @@ const report = {
   childTools: before.data.flatMap((message) => message.type === "assistant"
     ? message.content.filter((part) => part.type === "tool").map((part) => part.name) : []),
   childMessagesUnchanged: true, childDurableLogUnchanged: true, snapshots,
+  historyRead, messageRead, chunkRead,
 }
 await Bun.write(".test-artifacts/live-report.json", JSON.stringify(report, null, 2))
 console.log(JSON.stringify({ phase: "passed", parentID: parent.id, childID: child.id, childMessagesUnchanged: true, childDurableLogUnchanged: true }))

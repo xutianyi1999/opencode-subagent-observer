@@ -2,11 +2,11 @@ import type {
   OpenCodeClient,
   SessionEventDurable,
   SessionInfo,
-  SessionMessageAssistant,
   SessionMessageInfo,
 } from "@opencode/client"
 import type { z } from "zod"
 import { InspectInput, ListInput, Visibility } from "./schema.ts"
+import { fit, publicFields, readMessage, selectContent, snapshot } from "./messages.ts"
 
 export async function listSubagents(
   client: OpenCodeClient,
@@ -45,16 +45,18 @@ export async function inspectSubagent(
   if (session.parentID !== callerID || session.fork) {
     throw new Error("Only the calling session's direct, non-fork subagents can be inspected")
   }
-  const [active, page, permissions] = await Promise.all([
+  // Read the replay boundary before its fallback snapshot, so advancing the cursor cannot hide a newer projection.
+  const changes = input.view === "changes" ? await readChanges(client, input, signal) : undefined
+  const [active, page, permissions, historical, message] = await Promise.all([
     client.session.active({ signal }),
-    client.message.list({ sessionID: session.id, order: "desc", limit: input.limit }, { signal }),
+    client.message.list({ sessionID: session.id, order: "desc", limit: input.cursor || input.messageID ? 20 : input.limit }, { signal }),
     client.permission.request.list({ location: { directory: session.location.directory } }, { signal }),
+    input.cursor ? client.message.list({ sessionID: session.id, cursor: input.cursor, limit: input.limit }, { signal }) : undefined,
+    input.messageID ? client.session.message.get({ sessionID: session.id, messageID: input.messageID }, { signal }) : undefined,
   ])
   const running = active[session.id] !== undefined
   const waiting = permissions.data.filter((request) => request.sessionID === session.id)
-  const details = input.view === "changes"
-    ? await readChanges(client, input, signal)
-    : snapshot(page.data, input)
+  const details = changes ?? (message ? readMessage(message, input) : snapshot(historical ?? page, input))
   return {
     session: identity(session),
     observed: { startedAt, endedAt: Date.now() },
@@ -68,7 +70,7 @@ export async function inspectSubagent(
     },
     ...details,
     ...("historyUnavailable" in details && details.historyUnavailable
-      ? { snapshot: snapshot(page.data, input) } : {}),
+      ? { snapshot: snapshot(page, input) } : {}),
     visibility: Visibility,
   }
 }
@@ -86,42 +88,15 @@ function execution(session: SessionInfo, active: boolean) {
 
 function phase(messages: SessionMessageInfo[], active: boolean) {
   if (!active) return "inactive"
-  const latest = messages.find((message) => message.type === "assistant")
+  const latest = messages.find((message) => ["assistant", "shell", "compaction"].includes(message.type))
   if (!latest) return "unknown"
+  if (latest.type === "compaction") return latest.status === "running" ? "compacting" : "unknown"
+  if (latest.type === "shell") return latest.status === "running" ? "shell_running" : "unknown"
+  if (latest.type !== "assistant" || latest.time.completed !== undefined) return "unknown"
   if (latest.content.some((part) => part.type === "tool" && part.state.status === "running")) return "tool_running"
   if (latest.content.some((part) => part.type === "tool" && part.state.status === "streaming")) return "tool_input"
-  if (latest.time.completed !== undefined) return "unknown"
   if (latest.content.some((part) => part.type === "reasoning" && part.time && !part.time.completed)) return "reasoning"
   return "generating"
-}
-
-function snapshot(messages: SessionMessageInfo[], input: z.infer<typeof InspectInput>) {
-  const selected = messages.flatMap((message): Array<{
-    messageID: string; type: string; time: unknown; content?: Array<Record<string, unknown>>; text?: string
-  }> => {
-    if (message.type === "assistant") {
-      const content = message.content.flatMap((part): Array<Record<string, unknown>> => {
-        if (part.type === "text" && input.include.includes("messages")) return [{ type: part.type, text: part.text }]
-        if (part.type === "reasoning" && input.include.includes("reasoning")) {
-          return [{ type: part.type, text: part.text, time: part.time }]
-        }
-        if (part.type === "tool" && input.include.includes("tools")) return [toolPart(part)]
-        return []
-      })
-      if (!content.length) return []
-      return [{ messageID: message.id, type: message.type, time: message.time, content }]
-    }
-    if (input.include.includes("messages") && (message.type === "user" || message.type === "synthetic")) {
-      return [{ messageID: message.id, type: message.type, time: message.time, text: message.text }]
-    }
-    return []
-  })
-  const fitted = fitItems(selected, input.maxChars)
-  return { view: "snapshot", ...fitted, order: "newest_first", messageLimit: input.limit }
-}
-
-function toolPart(part: Extract<SessionMessageAssistant["content"][number], { type: "tool" }>) {
-  return { type: part.type, id: part.id, name: part.name, state: part.state, time: part.time }
 }
 
 async function readChanges(client: OpenCodeClient, input: z.infer<typeof InspectInput>, signal: AbortSignal) {
@@ -146,11 +121,16 @@ async function readChanges(client: OpenCodeClient, input: z.infer<typeof Inspect
     }
     if (includeEvent(event, input.include)) {
       if (items.length >= input.limit || remaining <= 0) break
-      const data = Object.fromEntries(Object.entries(event.data).filter(([key]) =>
-        !["state", "providerState", "providerResultState"].includes(key),
-      ))
+      const data = event.type === "session.message.content.updated"
+        ? { ...publicFields(event.data), content: selectContent(event.data.content, input.include) }
+        : publicFields(event.data)
       const fitted = fit(data, remaining)
-      items.push({ seq: event.durable.seq, type: event.type, created: event.created, ...fitted })
+      items.push({
+        seq: event.durable.seq, type: event.type, created: event.created,
+        ...("assistantMessageID" in event.data ? { messageID: event.data.assistantMessageID } : {}),
+        ...("messageID" in event.data ? { messageID: event.data.messageID } : {}),
+        ...fitted,
+      })
       remaining -= fitted.size
     }
     nextAfterSeq = event.durable.seq
@@ -168,27 +148,11 @@ async function readChanges(client: OpenCodeClient, input: z.infer<typeof Inspect
 }
 
 function includeEvent(event: SessionEventDurable, include: z.infer<typeof InspectInput>["include"]) {
-  if (/^session\.(execution|step|retry|compaction)\./.test(event.type)) return true
-  if (event.type.startsWith("session.tool.")) return include.includes("tools")
+  if (/^session\.(execution|step|retry|compaction|revert)\./.test(event.type)) return true
+  if (event.type === "session.message.content.updated") return include.length > 0
+  if (/^session\.(tool|shell)\./.test(event.type)) return include.includes("tools")
   if (event.type.startsWith("session.reasoning.")) return include.includes("reasoning")
-  if (event.type.startsWith("session.text.") || event.type === "session.inbox.delivered") return include.includes("messages")
+  if (/^session\.(text|agent|model|skill|instructions)\./.test(event.type) ||
+    ["session.inbox.delivered", "session.synthetic", "session.moved"].includes(event.type)) return include.includes("messages")
   return false
-}
-
-function fit(data: unknown, maxChars: number) {
-  const text = JSON.stringify(data)
-  if (text.length <= maxChars) return { data, truncated: false, size: text.length }
-  return { data: { previewJson: text.slice(0, maxChars) }, truncated: true, size: maxChars }
-}
-
-function fitItems(items: Array<{ messageID: string; type: string; time: unknown }>, maxChars: number) {
-  const result: Array<{ messageID: string; type: string; data: unknown; truncated: boolean }> = []
-  let remaining = maxChars
-  for (const item of items) {
-    if (remaining <= 0) break
-    const fitted = fit(item, remaining)
-    result.push({ messageID: item.messageID, type: item.type, ...fitted })
-    remaining -= fitted.size
-  }
-  return { items: result, truncated: result.length < items.length || result.some((item) => item.truncated) }
 }

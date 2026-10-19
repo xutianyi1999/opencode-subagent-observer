@@ -36,7 +36,7 @@ export default Plugin.define({
       })
       tools.add({
         name: "inspect_subagent",
-        description: "Read one of your direct subagents without notifying it. snapshot reads recent messages and tool states; include reasoning for visible persisted reasoning. changes reads durable events after afterSeq and returns nextAfterSeq. If the server omits event bodies, historyUnavailable=true and a current snapshot is included instead. An inactive child is not necessarily completed; inspect lastOutcome separately. No unfinished streaming tokens are available.",
+        description: "Read your direct subagent without notifying it. Default snapshot includes messages, visible reasoning and tools. Each message and selected part keeps an entry even if preview text is truncated. Use returned cursor for older history. To read long content fully, pass messageID, then follow nextOffset with offset and revision (same include); omit cursor/messageID to refresh recent activity. changes reads durable events after afterSeq and returns nextAfterSeq; when the server omits event bodies, historyUnavailable=true and a current snapshot is included. inactive does not imply completion; read lastOutcome. Unfinished stream tokens are unavailable.",
         input: InspectInput,
         output: ObservationOutput,
         options: { codemode: false },
