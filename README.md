@@ -74,11 +74,14 @@ OpenCode 原有的后台完成通知保留。插件通过官方上下文 hook �
 ```sh
 bun run check
 bun run test:live
+bun run test:live:scenarios
 ```
 
 check 执行类型检查、行为测试和构建。
 真实联调使用现有 OpenCode，在独立临时目录运行父子会话，先检查免费模型费用，不回退到付费模型。
-覆盖主动查询、历史翻页、长消息续读及子会话无写入；报告位于 .test-artifacts/live-report.json。
+test:live 覆盖模型主动查询、历史翻页、长消息续读及子会话无写入；报告位于 .test-artifacts/live-report.json。
+test:live:scenarios 通过官方 SDK 同时运行四个真实子任务，覆盖长工具结果、工具报错恢复、中断和等待授权，并与原始消息逐条比对。
+默认使用 mimo-v2.6-flash-free；可用 OBSERVER_TEST_MODEL 指定另一个已安装的零费用模型。场景报告保存在 .test-artifacts/scenarios-模型名.json。
 
 实现使用 TypeScript、Bun、OpenCode 官方插件/客户端和 Zod，没有额外框架。
 

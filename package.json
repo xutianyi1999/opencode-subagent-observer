@@ -11,6 +11,7 @@
     "typecheck": "bun --check",
     "test": "bun test",
     "test:live": "bun run build && bun script/live-test.ts",
+    "test:live:scenarios": "bun run build && bun script/live-scenarios.ts",
     "build": "bun build src/index.ts --outdir dist --target bun --packages external",
     "check": "bun run typecheck && bun test && bun run build"
   },

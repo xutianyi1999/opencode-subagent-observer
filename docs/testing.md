@@ -20,7 +20,8 @@ bun run check：类型检查、21 项行为测试和构建。
 ## 真实模型联调
 
 bun run test:live 使用现有后台服务，在独立临时目录创建父子会话。
-模型为 opencode/mimo-v2.6-flash-free，测试前检查费用为零，不回退到付费模型。
+默认模型为 opencode/mimo-v2.6-flash-free，测试前检查费用为零，不回退到付费模型。
+可通过 OBSERVER_TEST_MODEL 指定其他已安装的零费用模型。
 
 主 agent 列出子任务、派发后台 general 子 agent，然后主动查询、翻历史、按消息 ID 读取并分段续读。
 子 agent 只等待后读取 README 并总结，不接收配合观察的提示。
@@ -29,4 +30,28 @@ bun run test:live 使用现有后台服务，在独立临时目录创建父子�
 测试会话保留以便检查，报告在 .test-artifacts/live-report.json。
 不全局重载配置，不替换已有服务，不修改已有用户会话。
 
-真实联调覆盖正常后台执行。错误、等待权限与取消等路径由可控传输测试覆盖；不声称全部 provider 场景均已联调。
+## 并行场景实测
+
+```sh
+bun run test:live:scenarios
+OBSERVER_TEST_MODEL=deepseek-v4.1-flash-free bun run test:live:scenarios
+OBSERVER_TEST_MODEL=deepseek-v4.1-flash-free bun run test:live
+```
+
+test:live:scenarios 用官方 SDK 在独立临时目录创建父会话和四个真实 general 子会话，并行执行以下任务。主会话不执行模型调用；检查程序调用与插件相同的只读查询实现。模型是否能使用插件工具由 test:live 单独验证。
+
+- 读取含中文和 emoji 的长文件，产生长工具结果。
+- 读取缺失文件产生真实工具错误，再读取正常文件恢复。
+- 执行 sleep，查询到工具运行后中断，检查 interrupted 与工具错误。
+- shell 配置 ask 权限，确认 waiting_permission、请求归属及一次授权后的恢复。
+
+检查子任务列表与全部消息分页没有漏项或重复；256 字符预览保留全部工具的身份与状态。
+逐消息分段恢复 JSON，与原始消息逐项比对文字、可见推理、全部工具参数和结果。
+真实执行中读取消息后再中断，确认旧 revision 无法继续拼接。
+查询结束后比对会话和消息完全不变，并确认各子任务费用为 0。
+另检查不相关会话、父会话和 fork 被拒绝，跨会话消息 cursor 不会泄露其他会话记录。
+
+本轮在已安装的 OpenCode 2.0.32 上使用 mimo-v2.6-flash-free 与 deepseek-v4.1-flash-free 完成场景实测。
+报告保存在 .test-artifacts/scenarios-模型名.json，包含会话 ID、观察到的阶段、工具状态变化和比对统计。
+
+正常执行、工具报错、中断和等待权限已有真实覆盖；provider 失败重试尚未真实触发，自动压缩仍主要由可控传输测试覆盖，不声称所有异常均已实测。

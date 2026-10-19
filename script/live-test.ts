@@ -14,7 +14,7 @@ await Bun.write(join(directory, ".opencode/plugins/observer/index.ts"),
   `export { default } from ${JSON.stringify(entrypoint)}\n`)
 
 const models = await client.model.list({ location: { directory } })
-const model = models.data.find((model) => model.providerID === "opencode" && model.id === "mimo-v2.6-flash-free")
+const model = models.data.find((model) => model.providerID === "opencode" && model.id === (process.env.OBSERVER_TEST_MODEL ?? "mimo-v2.6-flash-free"))
 if (!model || !model.cost.every((tier) => tier.input === 0 && tier.output === 0)) {
   throw new Error("Expected an available zero-cost test model; refusing a paid fallback")
 }
