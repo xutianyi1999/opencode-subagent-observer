@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from "bun:test"
 import { OpenCode } from "@opencode/client"
-import type { SessionInfo, SessionLogItem, SessionMessageInfo } from "@opencode/client"
+import type { SessionInfo, SessionMessageInfo } from "@opencode/client"
 import { inspectSubagent, listSubagents } from "../src/observe.ts"
 import { InspectInput, ListInput } from "../src/schema.ts"
-import { adaptContext, backgroundText } from "../src/index.ts"
+import { adaptContext } from "../src/index.ts"
+import type { SessionContext } from "@opencode/plugin/promise/session"
 
 const servers = new Set<{ stop(closeActiveConnections?: boolean): unknown }>()
 afterEach(() => {
@@ -16,14 +17,6 @@ function session(id = "child", parentID = "parent"): SessionInfo {
     id, parentID, projectID: "project", title: "Fixture task", agent: "general",
     cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     outcome: "succeeded", time: { created: 1, updated: 2, idle: 2 }, location: { directory: "/fixture" },
-  }
-}
-
-function textEvent(seq: number, text = "visible text"): SessionLogItem {
-  return {
-    id: `evt-${seq}`, created: seq, type: "session.text.ended",
-    durable: { aggregateID: "child", seq, version: 1 },
-    data: { sessionID: "child", assistantMessageID: "msg", ordinal: 0, text },
   }
 }
 
@@ -41,9 +34,6 @@ function fixture() {
       ],
     }] as SessionMessageInfo[],
     olderMessages: [] as SessionMessageInfo[],
-    events: [textEvent(1), textEvent(2)] as SessionLogItem[],
-    omitLogEvents: false,
-    onLog: () => {},
     permissions: [] as Array<{ id: string; sessionID: string; action: string; resources: string[] }>,
     requests: [] as Array<{ method: string; url: URL }>,
   }
@@ -62,16 +52,6 @@ function fixture() {
       if (url.pathname.includes("/message/")) {
         const message = [...state.messages, ...state.olderMessages].find((entry) => entry.id === url.pathname.split("/").at(-1))
         return message ? Response.json({ data: message }) : new Response("Unknown message", { status: 404 })
-      }
-      if (url.pathname.endsWith("/log")) {
-        state.onLog()
-        const after = Number(url.searchParams.get("after") ?? 0)
-        const events = state.events.filter((event) => event.type !== "log.synced" && event.durable.seq > after)
-        const seq = state.events.at(-1)
-        const synced = { type: "log.synced", aggregateID: "child", seq: seq && seq.type !== "log.synced" ? seq.durable.seq : 0 }
-        return new Response([...(state.omitLogEvents ? [] : events), synced].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
-          headers: { "content-type": "text/event-stream" },
-        })
       }
       if (url.pathname === "/api/permission/request") return Response.json({ location: { directory: "/fixture" }, data: state.permissions })
       const target = state.sessions.find((entry) => url.pathname === `/api/session/${entry.id}`)
@@ -109,18 +89,11 @@ test("active execution does not overwrite the last completed outcome", async () 
   expect(f.state.requests.every((request) => request.method === "GET")).toBe(true)
 })
 
-test("reasoning can be selected explicitly and provider state is omitted", async () => {
+test("messages include reasoning and omit provider checkpoints", async () => {
   const f = fixture()
-  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", include: ["reasoning"] }), signal())
+  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child" }), signal())
   expect(JSON.stringify(result)).toContain("Visible reasoning")
   expect(JSON.stringify(result)).not.toContain("do not expose")
-})
-
-test("reasoning can be explicitly excluded without losing tool calls", async () => {
-  const f = fixture()
-  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", include: ["messages", "tools"] }), signal())
-  expect(JSON.stringify(result)).not.toContain("Visible reasoning")
-  expect(JSON.stringify(result)).toContain("README.md")
 })
 
 test("long reasoning cannot crowd out tool identities, errors or older messages", async () => {
@@ -134,11 +107,11 @@ test("long reasoning cannot crowd out tool identities, errors or older messages"
   ]
   f.state.messages.push({ id: "older", type: "user", time: { created: 1 }, text: "Earlier request" })
   const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", maxChars: 256 }), signal())
-  if (!("items" in result)) throw new Error("Expected snapshot")
-  expect(result.items.map((item) => "messageID" in item ? item.messageID : undefined)).toEqual(["msg", "older"])
-  expect(JSON.stringify(result.items)).toContain("important-call")
-  expect(JSON.stringify(result.items)).toContain("Important failure")
-  expect(JSON.stringify(result.items)).toContain('"status":"error"')
+  if (!("messages" in result)) throw new Error("Expected snapshot")
+  expect(result.messages.map((item) => item.id)).toEqual(["msg", "older"])
+  expect(JSON.stringify(result.messages)).toContain("important-call")
+  expect(JSON.stringify(result.messages)).toContain("Important failure")
+  expect(JSON.stringify(result.messages)).toContain('"status":"error"')
   expect(result.truncated).toBe(true)
 })
 
@@ -156,11 +129,11 @@ test("assistant failures without text, system, shell, compaction and control mes
     { id: "idle", type: "idle", time: { created: 1 }, outcome: "failed", error: { type: "Failure", message: "Execution failed" } },
   ]
   const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child" }), signal())
-  if (!("items" in result)) throw new Error("Expected snapshot")
-  expect(result.items.map((item) => item.type)).toEqual(["assistant", "system", "shell", "compaction", "agent-switched", "idle"])
-  expect(JSON.stringify(result.items)).toContain("Model unavailable")
-  expect(JSON.stringify(result.items)).toContain("Instruction update")
-  expect(JSON.stringify(result.items)).toContain("Execution failed")
+  if (!("messages" in result)) throw new Error("Expected snapshot")
+  expect(result.messages.map((item) => item.type)).toEqual(["assistant", "system", "shell", "compaction", "agent-switched", "idle"])
+  expect(JSON.stringify(result.messages)).toContain("Model unavailable")
+  expect(JSON.stringify(result.messages)).toContain("Instruction update")
+  expect(JSON.stringify(result.messages)).toContain("Execution failed")
 })
 
 test("older history uses the official cursor without changing current activity", async () => {
@@ -170,8 +143,8 @@ test("older history uses the official cursor without changing current activity",
   if (!("cursor" in first)) throw new Error("Expected snapshot")
   expect(first.cursor).toBe("older-page")
   const older = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", cursor: first.cursor }), signal())
-  if (!("items" in older)) throw new Error("Expected snapshot")
-  expect(older.items.map((item) => "messageID" in item ? item.messageID : undefined)).toEqual(["old"])
+  if (!("messages" in older)) throw new Error("Expected snapshot")
+  expect(older.messages.map((item) => item.id)).toEqual(["old"])
   expect(older.activity.phase).toBe("tool_running")
   const request = f.state.requests.find((request) => request.url.searchParams.has("cursor"))
   expect(request?.url.searchParams.get("cursor")).toBe("older-page")
@@ -253,8 +226,8 @@ test("a failed tool does not turn the whole child into a failed execution", asyn
   const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child" }), signal())
   expect(result.execution.active).toBe(true)
   expect(result.execution.lastOutcome).toBe("succeeded")
-  if (!("items" in result)) throw new Error("Expected snapshot")
-  expect(JSON.stringify(result.items)).toContain("File missing")
+  if (!("messages" in result)) throw new Error("Expected snapshot")
+  expect(JSON.stringify(result.messages)).toContain("File missing")
 })
 
 test("inactive sessions retain an interrupted outcome without reporting completion", async () => {
@@ -297,76 +270,7 @@ test("ownership rejection happens before reading a child's contents", async () =
   expect(f.state.requests.map((request) => request.url.pathname)).toEqual(["/api/session/child"])
 })
 
-test("finite log replay continues from the last returned event without gaps", async () => {
-  const f = fixture()
-  const first = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", view: "changes", limit: 1 }), signal())
-  if (!("nextAfterSeq" in first)) throw new Error("Expected changes result")
-  expect(first.nextAfterSeq).toBe(1)
-  expect(first.synced).toBe(false)
-  const next = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", view: "changes", afterSeq: first.nextAfterSeq }), signal())
-  if (!("nextAfterSeq" in next)) throw new Error("Expected changes result")
-  expect(next.items.map((item) => "seq" in item ? item.seq : undefined)).toEqual([2])
-  expect(next.synced).toBe(true)
-  expect(f.state.requests.filter((request) => request.url.pathname.endsWith("/log")).every((request) => request.url.searchParams.get("follow") === "false")).toBe(true)
-})
-
-test("oversized events are explicitly truncated and preserve their sequence", async () => {
-  const f = fixture()
-  f.state.events = [textEvent(1, "x".repeat(10000)), textEvent(2)]
-  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", view: "changes", maxChars: 256 }), signal())
-  expect(result.truncated).toBe(true)
-  if (!("nextAfterSeq" in result)) throw new Error("Expected changes result")
-  expect(result.nextAfterSeq).toBe(1)
-  expect(result.items[0]?.truncated).toBe(true)
-})
-
-test("a cursor beyond available history requests an explicit reset", async () => {
-  const f = fixture()
-  await expect(inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", view: "changes", afterSeq: 100 }), signal())).rejects.toThrow("cursor")
-})
-
-test("a host with sequence markers but no event bodies returns an explicit snapshot fallback", async () => {
-  const f = fixture()
-  f.state.omitLogEvents = true
-  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", view: "changes" }), signal())
-  if (!("nextAfterSeq" in result)) throw new Error("Expected changes result")
-  expect(result.nextAfterSeq).toBe(2)
-  expect(result.historyUnavailable).toBe(true)
-  expect(result.items).toEqual([])
-  expect(JSON.stringify(result.snapshot)).toContain("README.md")
-})
-
-test("fallback snapshots are fetched after the log boundary they acknowledge", async () => {
-  const f = fixture()
-  f.state.omitLogEvents = true
-  f.state.onLog = () => {
-    f.state.messages = [{ id: "fresh", type: "system", time: { created: 4 }, text: "Newly projected update" }]
-  }
-  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", view: "changes" }), signal())
-  expect(JSON.stringify(result.snapshot)).toContain("Newly projected update")
-  const paths = f.state.requests.map((request) => request.url.pathname)
-  expect(paths.indexOf("/api/experimental/session/child/log")).toBeLessThan(paths.indexOf("/api/session/child/message"))
-})
-
-test("durable content replacements retain tools and reasoning without exposing provider checkpoints", async () => {
-  const f = fixture()
-  f.state.events = [{
-    id: "evt-1", type: "session.message.content.updated", created: 1,
-    durable: { aggregateID: "child", seq: 1, version: 1 },
-    data: { sessionID: "child", messageID: "msg", content: [
-      { type: "reasoning", text: "Replaced reasoning", state: { encrypted: "hidden-checkpoint" } },
-      { type: "tool", id: "replacement-call", name: "read", time: { created: 1 },
-        providerState: { encrypted: "hidden-checkpoint" },
-        state: { status: "completed", input: { path: "README.md" }, content: [{ type: "text", text: "Replacement result" }] } },
-    ] },
-  }]
-  const result = await inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child", view: "changes" }), signal())
-  expect(JSON.stringify(result)).toContain("Replaced reasoning")
-  expect(JSON.stringify(result)).toContain("Replacement result")
-  expect(JSON.stringify(result)).not.toContain("hidden-checkpoint")
-})
-
-test("incompatible pagination and detail arguments are rejected at the schema boundary", () => {
+test("removed modes and conflicting pagination arguments are rejected at the schema boundary", () => {
   expect(InspectInput.safeParse({ sessionID: "child", view: "changes", cursor: "older" }).success).toBe(false)
   expect(InspectInput.safeParse({ sessionID: "child", messageID: "msg", cursor: "older" }).success).toBe(false)
   expect(InspectInput.safeParse({ sessionID: "child", offset: 2 }).success).toBe(false)
@@ -378,19 +282,26 @@ test("caller cancellation reaches the SDK", async () => {
   await expect(inspectSubagent(f.client, "parent", InspectInput.parse({ sessionID: "child" }), AbortSignal.abort())).rejects.toThrow()
 })
 
-test("prompt adaptation only changes delegation guidance and preserves other schema fields", () => {
-  const event = { tools: {
-    inspect_subagent: { description: "Inspect", input: {} },
-    subagent: { description: "Delegate", input: {
-      type: "object", properties: { background: { type: "boolean", description: "DO NOT poll" }, prompt: { type: "string" } },
-    } },
-  } }
+test("parent observation policy uses the context hook without rewriting tool definitions", () => {
+  const event = {
+    system: [] as SessionContext["system"],
+    tools: {
+      inspect_subagent: { description: "Inspect", input: {} },
+      subagent: { description: "Delegate", input: { type: "object" } },
+    },
+  }
+  const tools = JSON.stringify(event.tools)
   adaptContext(event)
-  expect(JSON.stringify(event.tools.subagent)).toContain("read progress")
-  expect(JSON.stringify(event.tools.subagent)).not.toContain("DO NOT poll")
-  expect(event.tools.subagent.input.properties.prompt).toEqual({ type: "string" })
-  const original = "The subagent is working in the background (sessionID: child). You will be notified automatically when it finishes.\nDO NOT sleep, poll for progress, ask the subagent for status, or duplicate this subagent's work; avoid working with the same files or topics it is using."
-  expect(backgroundText(original)).toContain("inspect_subagent")
-  expect(backgroundText(original)).toContain("sessionID: child")
-  expect(backgroundText("Unrelated text")).toBe("Unrelated text")
+  expect(event.system).toHaveLength(1)
+  expect(event.system[0]?.text).toContain("read-only observer tools are permitted")
+  expect(JSON.stringify(event.tools)).toBe(tools)
+})
+
+test("a child without delegation tools receives no parent observation policy", () => {
+  const event = {
+    system: [] as SessionContext["system"],
+    tools: { inspect_subagent: { description: "Inspect", input: {} } },
+  }
+  adaptContext(event)
+  expect(event.system).toEqual([])
 })
