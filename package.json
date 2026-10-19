@@ -1,0 +1,26 @@
+{
+  "name": "opencode-subagent-observer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "An OpenCode V2 plugin for parent-initiated, read-only inspection of subagents.",
+  "packageManager": "bun@1.4.3",
+  "exports": { ".": "./dist/index.js", "./server": "./dist/index.js" },
+  "files": ["dist", "server.js", "README.md"],
+  "scripts": {
+    "typecheck": "bun --check",
+    "test": "bun test",
+    "test:live": "bun run build && bun script/live-test.ts",
+    "build": "bun build src/index.ts --outdir dist --target bun --packages external",
+    "check": "bun run typecheck && bun test && bun run build"
+  },
+  "dependencies": {
+    "@opencode/client": "2.0.32",
+    "@opencode/plugin": "2.0.32",
+    "zod": "4.1.8"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.3",
+    "typescript": "7.0.2"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "plugins": [
+    {
+      "package": "/mnt/data/code/opencode-subagent-observer",
+      "options": {
+        "timeoutMs": 15000
+      }
+    }
+  ]
+}
